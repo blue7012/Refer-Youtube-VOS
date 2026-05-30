@@ -71,7 +71,7 @@ def noDP(state_dict):
 
 def load_NoPrefix(path, length):
     # load dataparallel wrapped model properly
-    state_dict = torch.load(path)
+    state_dict = torch.load(path, weights_only=False)
     # create new OrderedDict that does not contain `module.`
     from collections import OrderedDict
     new_state_dict = OrderedDict()
@@ -112,9 +112,9 @@ def Dilate(module, rate):
 
 def ToCudaVariable(xs, volatile=False, requires_grad=False):
     if torch.cuda.is_available():
-        return [Variable(x.cuda(), volatile=volatile, requires_grad=requires_grad) for x in xs]
+        return [x.cuda().requires_grad_(requires_grad) for x in xs]
     else:
-        return [Variable(x, volatile=volatile, requires_grad=requires_grad) for x in xs]
+        return [x.requires_grad_(requires_grad) for x in xs]
 
 def ToCuda(xs):
     if torch.cuda.is_available():
@@ -252,8 +252,8 @@ def db_eval_iou(annotation,segmentation):
 
     """
 
-    annotation   = annotation.astype(np.bool)
-    segmentation = segmentation.astype(np.bool)
+    annotation   = annotation.astype(bool)
+    segmentation = segmentation.astype(bool)
 
     if np.isclose(np.sum(annotation),0) and np.isclose(np.sum(segmentation),0):
         return 1
@@ -342,7 +342,7 @@ def seg2bmap(seg,width=None,height=None):
      January 2003
     """
 
-    seg = seg.astype(np.bool)
+    seg = seg.astype(bool)
     seg[seg>0] = 1
 
     assert np.atleast_3d(seg).shape[2] == 1
@@ -438,7 +438,7 @@ def overlay_mask(im, ann, alpha=0.5, colors=None, contour_thickness=None):
         Numpy Array: Image of the overlay with shape (H, W, 3) and data type
             `np.uint8`.
     """
-    im, ann = np.asarray(im, dtype=np.uint8), np.asarray(ann, dtype=np.int)
+    im, ann = np.asarray(im, dtype=np.uint8), np.asarray(ann, dtype=int)
     if im.shape[:-1] != ann.shape:
         raise ValueError('First two dimensions of `im` and `ann` must match')
     if im.shape[-1] != 3:

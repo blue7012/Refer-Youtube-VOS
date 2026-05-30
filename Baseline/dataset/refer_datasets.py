@@ -148,17 +148,17 @@ class REFER_YV_2019(data.Dataset):
             self.corpus.load_file(vocab_path)
             torch.save(self.corpus, corpus_path)
         else:
-            self.corpus = torch.load(corpus_path)
+            self.corpus = torch.load(corpus_path, weights_only=False)
 
             
     def random_crop(self, frame, mask, size, rnd):
 
         # resize `frame` before cropping
         # resized frame should be large than `size` but shouldn't be too large
-        min_scale = np.maximum(size[0]/np.float(frame.shape[0]), size[1]/np.float(frame.shape[1]))
+        min_scale = np.maximum(size[0]/float(frame.shape[0]), size[1]/float(frame.shape[1]))
         scale = np.maximum(rnd.uniform(min_scale+0.01, 1.875*min_scale), min_scale+0.01)
 
-        dsize = (np.int(frame.shape[1]*scale), np.int(frame.shape[0]*scale))
+        dsize = (int(frame.shape[1]*scale), int(frame.shape[0]*scale))
         trans_frame  = cv2.resize(frame, dsize=dsize, interpolation=cv2.INTER_LINEAR)
         trans_mask = cv2.resize(mask, dsize=dsize, interpolation=cv2.INTER_NEAREST)
         
@@ -203,8 +203,8 @@ class REFER_YV_2019(data.Dataset):
 
     
     def resize(self, frame, mask, size):
-        scale = np.maximum(size[0]/np.float(frame.shape[0]), size[1]/np.float(frame.shape[1]))
-        dsize = (np.int(frame.shape[1]*scale), np.int(frame.shape[0]*scale))
+        scale = np.maximum(size[0]/float(frame.shape[0]), size[1]/float(frame.shape[1]))
+        dsize = (int(frame.shape[1]*scale), int(frame.shape[0]*scale))
         size = (size[0], size[1])
         resize_frame  = cv2.resize(frame, dsize=size, interpolation=cv2.INTER_LINEAR)
         resize_mask = cv2.resize(mask, dsize=size, interpolation=cv2.INTER_NEAREST)

@@ -70,6 +70,7 @@ class Trainer():
         self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.lr)
         self.criterion = torch.nn.CrossEntropyLoss(reduction='none')
         self.scheme = self.base_scheme
+        self.scaler = torch.amp.GradScaler('cuda')
         
         self.logger = get_logger(self.arch)
         
@@ -130,7 +131,7 @@ class Trainer():
             file_name = self.get_file_name()
             checkpoint_path = CHECKPOINT_ROOT / self.dataset / file_name / 'e{:04d}.pth'.format(epoch)
             
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
         self.model.load_state_dict((checkpoint['state_dict'])) # Set CUDA before if error occurs.
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.epoch = checkpoint['epoch']
@@ -246,24 +247,26 @@ class Trainer():
                 data_time.update(time.time() - end)
 
                 frames, gt_masks, words, _ = V  
-                frames, gt_masks, words = ToCuda([frames, gt_masks, words])   
-                
-                est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=False)
-                
+                frames, gt_masks, words = ToCuda([frames, gt_masks, words])
+
+                with torch.amp.autocast('cuda'):
+                    est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=False)
+
                 losses.update(loss.item(), N_end - N_start)
                 iou = [0]*self.N
                 for n in range(N_start, N_end):
-                    iou_n = IoU(est_masks[:,n], gt_masks[:,n]) 
+                    iou_n = IoU(est_masks[:,n], gt_masks[:,n])
                     iou[n] = iou_n
                 miou = sum(iou[N_start:N_end])/(N_end - N_start)
-                
+
                 for n in range(N_start, N_end):
                     IoUs[n].update(iou[n])
                 mIoU.update(miou)
-                    
+
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 
                 batch_time.update(time.time() - end)
                 end = time.time()
