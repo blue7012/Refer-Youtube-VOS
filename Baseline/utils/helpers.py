@@ -15,6 +15,8 @@ from PIL import Image
 import numpy as np
 import os
 import copy
+import functools
+import math
 # from itertools impor
 import cv2
 import random, pdb
@@ -260,6 +262,12 @@ def db_eval_iou(annotation,segmentation):
         return np.sum((annotation & segmentation)) / \
                 np.sum((annotation | segmentation),dtype=np.float32)
 
+@functools.lru_cache(maxsize=16)
+def _cached_disk(r):
+    from skimage.morphology import disk
+    return disk(r)
+
+
 def db_eval_boundary(foreground_mask,gt_mask,bound_th=0.008):
     """
     Compute mean,recall and decay from per-frame evaluation.
@@ -275,9 +283,10 @@ def db_eval_boundary(foreground_mask,gt_mask,bound_th=0.008):
         P (float): boundaries precision
         R (float): boundaries recall
     """
+    from skimage.morphology import binary_dilation
     foreground_mask = (foreground_mask>0.5).cpu().numpy().transpose(1, 2, 0)
     gt_mask = gt_mask.cpu().numpy().transpose(1, 2, 0)
-    
+
     assert np.atleast_3d(foreground_mask).shape[2] == 1
 
     bound_pix = bound_th if bound_th >= 1 else \
@@ -286,11 +295,10 @@ def db_eval_boundary(foreground_mask,gt_mask,bound_th=0.008):
     # Get the pixel boundaries of both masks
     fg_boundary = seg2bmap(foreground_mask)[:, :, 0]
     gt_boundary = seg2bmap(gt_mask)[:, :, 0]
-    
-    from skimage.morphology import binary_dilation,disk
 
-    fg_dil = binary_dilation(fg_boundary,disk(bound_pix))
-    gt_dil = binary_dilation(gt_boundary,disk(bound_pix))
+    d = _cached_disk(int(bound_pix))
+    fg_dil = binary_dilation(fg_boundary, d)
+    gt_dil = binary_dilation(gt_boundary, d)
 
     # Get the intersection
     gt_match = gt_boundary * fg_dil
@@ -384,6 +392,81 @@ def seg2bmap(seg,width=None,height=None):
     return bmap
 
 
+# ── GPU boundary evaluation (replaces skimage-based db_eval_boundary) ─────────
+
+_disk_kernel_cache = {}
+
+
+def get_disk_kernel_gpu(radius, device):
+    key = (radius, str(device))
+    if key not in _disk_kernel_cache:
+        r = radius
+        size = 2 * r + 1
+        idx = torch.arange(size, dtype=torch.float32)
+        y, x = torch.meshgrid(idx, idx, indexing='ij')
+        disk = ((x - r) ** 2 + (y - r) ** 2 <= r ** 2).float()
+        _disk_kernel_cache[key] = disk.view(1, 1, size, size).to(device)
+    return _disk_kernel_cache[key]
+
+
+def seg2bmap_gpu(seg):
+    # seg: (N, 1, H, W) binary float tensor
+    b = torch.zeros_like(seg, dtype=torch.bool)
+    b[:, :, :, :-1]   |= (seg[:, :, :, :-1]   != seg[:, :, :, 1:])
+    b[:, :, :-1, :]   |= (seg[:, :, :-1, :]   != seg[:, :, 1:, :])
+    b[:, :, :-1, :-1] |= (seg[:, :, :-1, :-1] != seg[:, :, 1:, 1:])
+    return b.float()
+
+
+def boundary_f_score_gpu(est_masks, gt_masks, bound_th=0.008):
+    """
+    est_masks: (B, T, H, W) float on GPU — predicted soft masks
+    gt_masks:  (B, T, H, W) float on GPU — ground-truth binary masks
+    returns:   (B, T) float — per-frame F-score, stays on GPU
+    """
+    B, T, H, W = est_masks.shape
+    bound_pix = max(1, int(math.ceil(bound_th * math.sqrt(H * H + W * W))))
+
+    fg = (est_masks > 0.5).float().view(B * T, 1, H, W)
+    gt = (gt_masks  > 0.5).float().view(B * T, 1, H, W)
+
+    fg_bnd = seg2bmap_gpu(fg)
+    gt_bnd = seg2bmap_gpu(gt)
+
+    disk_k = get_disk_kernel_gpu(bound_pix, est_masks.device)
+    fg_dil = (F.conv2d(fg_bnd, disk_k, padding=bound_pix) > 0).float()
+    gt_dil = (F.conv2d(gt_bnd, disk_k, padding=bound_pix) > 0).float()
+
+    n_fg     = fg_bnd.view(B * T, -1).sum(-1)
+    n_gt     = gt_bnd.view(B * T, -1).sum(-1)
+    fg_match = (fg_bnd * gt_dil).view(B * T, -1).sum(-1)
+    gt_match = (gt_bnd * fg_dil).view(B * T, -1).sum(-1)
+
+    # replicate the edge-case logic of the original db_eval_boundary
+    prec = torch.ones_like(n_fg)
+    rec  = torch.ones_like(n_gt)
+    prec = torch.where((n_fg > 0) & (n_gt == 0), torch.zeros_like(prec), prec)
+    rec  = torch.where((n_fg == 0) & (n_gt > 0), torch.zeros_like(rec),  rec)
+    both = (n_fg > 0) & (n_gt > 0)
+    prec = torch.where(both, fg_match / (n_fg + 1e-9), prec)
+    rec  = torch.where(both, gt_match / (n_gt + 1e-9), rec)
+    denom = prec + rec
+    return torch.where(denom > 0, 2 * prec * rec / denom,
+                       torch.zeros_like(denom)).view(B, T)
+
+
+def iou_per_frame_gpu(est_masks, gt_masks):
+    """
+    est_masks: (B, T, H, W) float on GPU
+    gt_masks:  (B, T, H, W) float on GPU
+    returns:   (B, T) float — per-frame IoU, stays on GPU
+    """
+    B, T, H, W = est_masks.shape
+    fg = (est_masks > 0.5).float().view(B * T, -1)
+    gt = (gt_masks  > 0.5).float().view(B * T, -1)
+    I  = (fg * gt).sum(-1)
+    U  = ((fg + gt) - fg * gt).sum(-1)
+    return (I / (U + 1e-5)).view(B, T)
 
 
 ##########################################

@@ -322,43 +322,38 @@ class Trainer():
             
             with torch.no_grad():
                 for i, V in enumerate(tqdm(val_loader, dynamic_ncols=True)):
-                    
+
                     data_time.update(time.time() - end)
 
-                    frames, gt_masks, words, ref_ids, num_frames, metas = V 
+                    frames, gt_masks, words, ref_ids, num_frames, metas = V
                     T = num_frames.max().item()
-                    
+
                     frames, gt_masks = frames[:, :T] , gt_masks[:, :T]
                     B, T, _, W, H = frames.size()
                     (frames, gt_masks), pad = pad_divide_by([frames, gt_masks], 16, (W, H))
                     frames, gt_masks, words = ToCuda([frames, gt_masks, words])
 
-                    est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=True)
+                    with torch.amp.autocast('cuda'):
+                        est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=True)
                     losses.update(loss.item(), N_end - N_start)
-                        
-                    for b, n_frame in enumerate(num_frames):
-                        j_score = 0.
-                        f_score = 0.
-                        ious = []
-                        for t in range(n_frame):
-                            iou_t = IoU(est_masks[b:b+1,t], gt_masks[b:b+1,t])
-                            j_score += iou_t
-                            ious.append(iou_t)
-                            f_score += db_eval_boundary(est_masks[b:b+1,t], gt_masks[b:b+1,t])
 
-                        j_score /= float(n_frame)
-                        f_score /= float(n_frame)
-                        iou_all = IoU(est_masks[b], gt_masks[b])
+                    # batch GPU metrics — no CPU transfer, no skimage
+                    iou_bt = iou_per_frame_gpu(est_masks, gt_masks)      # (B, T)
+                    f_bt   = boundary_f_score_gpu(est_masks, gt_masks)   # (B, T)
+
+                    for b, n_frame in enumerate(num_frames):
+                        j_score = iou_bt[b, :n_frame].mean().item()
+                        f_score = f_bt[b,  :n_frame].mean().item()
+                        ious    = iou_bt[b, :n_frame].tolist()
 
                         J.update(j_score)
                         F.update(f_score)
 
                         eval_json.j_score[ref_ids[b]] = j_score
                         eval_json.f_score[ref_ids[b]] = f_score
-                        eval_json.ious[ref_ids[b]] = ious
-                        
-                        # Precision
-                        precs += (j_score>precs_thres).astype(int)
+                        eval_json.ious[ref_ids[b]]    = ious
+
+                        precs += (j_score > precs_thres).astype(int)
                         num_samples += 1
 
 
