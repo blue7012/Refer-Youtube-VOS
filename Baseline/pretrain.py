@@ -42,10 +42,14 @@ def main():
         return parser.parse_args()
 
     args = get_arguments()
-    
+
+    print('[DEBUG] >>> Building Trainer...', flush=True)
     trainer = Trainer(args)
+    print('[DEBUG] >>> Trainer built. Moving model to CUDA...', flush=True)
     trainer.cuda()
+    print('[DEBUG] >>> Model on CUDA. Building datasets (set_dataset)...', flush=True)
     trainer.set_dataset(args.dataset, args.splits, args.test_dataset)
+    print('[DEBUG] >>> set_dataset DONE.', flush=True)
     if args.epoch != -1 or args.eval:
         trainer.load_model(args.epoch)
 
@@ -54,6 +58,7 @@ def main():
         trainer.evaluate()
         if not args.eval_first:
             return
+    print('[DEBUG] >>> Starting trainer.train()...', flush=True)
     trainer.train()
     
 if __name__ == "__main__":

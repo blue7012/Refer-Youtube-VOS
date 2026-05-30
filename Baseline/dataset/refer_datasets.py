@@ -69,15 +69,24 @@ class REFER_YV_2019(data.Dataset):
         
     def set_meta_file(self):
 
-        mymeta_path = self.data_root / self.split / 'mymeta.pkl'
+        mymeta_name = 'mymeta_eval.pkl' if self.eval else 'mymeta.pkl'
+        mymeta_path = self.data_root / self.split / mymeta_name
+        print('[DEBUG]     set_meta_file: split={} eval={} -> {}'.format(self.split, self.eval, mymeta_path), flush=True)
         if mymeta_path.exists():
+            print('[DEBUG]     set_meta_file: cache EXISTS, loading pickle (fast)...', flush=True)
             with mymeta_path.open('rb') as f:
                 self.videos = pickle.load(f)
+            print('[DEBUG]     set_meta_file: pickle loaded.', flush=True)
         else:
             data = json.load(open(self.data_root / self.split / 'meta_expressions.json'))
-            
+            n_total = len(data['videos'])
+            print('[DEBUG]     set_meta_file: NO cache -> BUILDING from {} videos '
+                  '(reads every mask PNG, this is the slow part)...'.format(n_total), flush=True)
+
             self.videos = []
-            for vid, objs in tqdm.tqdm(data['videos'].items(), desc='Data processing'):
+            for _vi, (vid, objs) in enumerate(tqdm.tqdm(data['videos'].items(), desc='Data processing')):
+                if _vi % 50 == 0:
+                    print('[DEBUG]     set_meta_file: building... {}/{} videos'.format(_vi, n_total), flush=True)
                     
                 if self.eval:
                     for obj_id, obj in objs['objects'].items():
@@ -113,9 +122,11 @@ class REFER_YV_2019(data.Dataset):
                             print("Not included : ", vid, oid, anker)
             
             
+            print('[DEBUG]     set_meta_file: BUILD done, saving cache pickle...', flush=True)
             with mymeta_path.open('wb') as f:
                 pickle.dump(self.videos, f, pickle.HIGHEST_PROTOCOL)
-                
+            print('[DEBUG]     set_meta_file: cache saved.', flush=True)
+
         len_videos = len(self.videos)
         if self.scale < 1.0:
             len_videos = int(len_videos * self.scale)

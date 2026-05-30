@@ -88,8 +88,19 @@ class Trainer():
             
 
     def cuda(self):
+        print('[DEBUG]   cuda: torch', torch.__version__,
+              '| is_available =', torch.cuda.is_available(),
+              '| device_count =', torch.cuda.device_count(), flush=True)
+        print('[DEBUG]   cuda: forcing CUDA init with a tiny tensor...', flush=True)
+        _t = torch.zeros(1).cuda()   # <-- if it hangs HERE, it is pure CUDA/driver init
+        torch.cuda.synchronize()
+        print('[DEBUG]   cuda: tiny tensor OK on', _t.device,
+              '| name =', torch.cuda.get_device_name(0), flush=True)
+        print('[DEBUG]   cuda: wrapping model in DataParallel + .cuda()...', flush=True)
         self.model = nn.DataParallel(self.model).cuda()
+        print('[DEBUG]   cuda: model on GPU. moving criterion...', flush=True)
         self.criterion = self.criterion.cuda()
+        print('[DEBUG]   cuda: DONE.', flush=True)
         
 
     def update_hyperparam_epoch(self):
@@ -149,16 +160,20 @@ class Trainer():
             test_dataset = dataset
         
         self.dataset = dataset
+        print('[DEBUG]   set_dataset: building TRAIN set...', flush=True)
         train_set, train_loader = factory.get_dataset(
-            dataset, DATA_ROOT, self.max_N, self.batch_size, self.img_size, 
+            dataset, DATA_ROOT, self.max_N, self.batch_size, self.img_size,
             self.max_skip
         )
+        print('[DEBUG]   set_dataset: TRAIN set ready, len =', len(train_set), flush=True)
         self.train_set = train_set
         self.train_loader = train_loader
 
         val_sets, val_loaders = [], []
         for split in test_splits:
+            print('[DEBUG]   set_dataset: building VAL set split =', split, flush=True)
             val_set, val_loader = factory.get_dataset_test(test_dataset, split, DATA_ROOT, self.test_batch_size, self.img_size)
+            print('[DEBUG]   set_dataset: VAL set ready, len =', len(val_set), flush=True)
             val_sets.append(val_set)
             val_loaders.append(val_loader)
         self.val_sets = val_sets
@@ -222,8 +237,12 @@ class Trainer():
 
             end = time.time()
 
+            print('[DEBUG]   train: waiting for FIRST batch from DataLoader '
+                  '(num_workers=8)... if stuck here, the worker __getitem__ is the bottleneck', flush=True)
             for i, V in enumerate(tqdm(self.train_loader, dynamic_ncols=True)):
-                
+
+                if i == 0:
+                    print('[DEBUG]   train: GOT first batch!', flush=True)
                 data_time.update(time.time() - end)
 
                 frames, gt_masks, words, _ = V  
