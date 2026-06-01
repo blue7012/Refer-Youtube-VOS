@@ -37,8 +37,16 @@ HF_REPO_TYPE = "dataset"
 # Thu muc data goc (tinh tu Baseline). DATA_ROOT cua trainer.py = ./data
 DATA_DIR = "data"
 
-# Cac file cache se duoc tai ve o fast path (khop theo duong dan tuong doi trong repo)
-FAST_PATH_PATTERNS = ["**/*.pkl", "**/corpus.pth", "**/vocabulary_Gref.txt"]
+# Ten file zip chua toan bo data/ tren repo (upload 1 file -> tranh rate limit 429)
+DATA_ZIP_NAME = "data.zip"
+
+# Cac file cache nho upload RIENG LE (ngoai zip) de fast-path keo nhanh,
+# khong phai tai nguyen data.zip nang. Glob de quy tuong doi tinh tu DATA_DIR.
+CACHE_GLOBS = ["**/*.pkl", "**/corpus.pth", "**/vocabulary_Gref.txt"]
+
+# Fast-path chi keo cac file cache nho (dung y ban dau: "chi clone file pkl").
+# Anh tho gia su da co san tren may (hoac giai nen tu data.zip neu can).
+FAST_PATH_PATTERNS = CACHE_GLOBS
 
 
 def log(msg):
@@ -131,8 +139,32 @@ def build_pkl_via_trainer():
     log("Build pkl DONE.")
 
 
+def zip_data_dir():
+    """Nen toan bo data/ thanh 1 file data.zip (ZIP_STORED — JPEG/PNG da nen san,
+    nen lai chi ton CPU ma khong giam dung luong). Tra ve Path cua zip."""
+    import zipfile
+
+    zip_path = Path(DATA_ZIP_NAME)
+    if zip_path.exists():
+        log("Da co {} san -> dung lai (xoa file nay neu muon nen lai).".format(zip_path))
+        return zip_path
+
+    data_root = Path(DATA_DIR)
+    files = [p for p in data_root.rglob("*") if p.is_file()]
+    log("Nen {} file tu '{}/' -> {} (ZIP_STORED)...".format(len(files), DATA_DIR, zip_path))
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for i, p in enumerate(files):
+            # arcname giu cau truc "data/..." de giai nen la ra dung cho cu
+            zf.write(p, arcname=str(p))
+            if (i + 1) % 2000 == 0:
+                log("  ...da nen {}/{} file".format(i + 1, len(files)))
+    log("Nen XONG: {} ({:.1f} MB)".format(zip_path, zip_path.stat().st_size / 1e6))
+    return zip_path
+
+
 def upload_full_dataset(api, token):
-    """Upload toan bo thu muc data/ (dataset + pkl + vocab + corpus)."""
+    """Upload data dang 1 file zip (tranh rate-limit 429 do upload tung anh) +
+    cac file cache nho upload rieng le de fast-path keo nhanh."""
     if not Path(DATA_DIR).is_dir():
         raise SystemExit(
             "Khong thay thu muc '{}/'. Can co data tho truoc khi build/upload.".format(DATA_DIR)
@@ -140,23 +172,36 @@ def upload_full_dataset(api, token):
     log("Tao repo (neu chua co)...")
     api.create_repo(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, token=token, exist_ok=True)
 
-    log("Upload toan bo '{}/' len {} (co the lau, day la one-time)...".format(DATA_DIR, HF_REPO_ID))
-    # upload_large_folder toi uu cho folder nang; fallback upload_folder neu ban hf_hub cu
-    try:
-        api.upload_large_folder(
+    # 1) Nen + upload data.zip (1 request lon, khong dung gioi han so request)
+    zip_path = zip_data_dir()
+    log("Upload {} len {} (one-time, co the lau)...".format(DATA_ZIP_NAME, HF_REPO_ID))
+    api.upload_file(
+        path_or_fileobj=str(zip_path),
+        path_in_repo=DATA_ZIP_NAME,
+        repo_id=HF_REPO_ID,
+        repo_type=HF_REPO_TYPE,
+        token=token,
+        commit_message="Upload dataset as single zip",
+    )
+
+    # 2) Upload rieng cac file cache nho de fast-path khong phai tai nguyen zip
+    cache_files = []
+    for pat in CACHE_GLOBS:
+        cache_files.extend(sorted(Path(DATA_DIR).glob(pat)))
+    log("Upload {} file cache rieng le (pkl/corpus/vocab)...".format(len(cache_files)))
+    for p in cache_files:
+        # path_in_repo TUONG DOI voi DATA_DIR (khong co tien to "data/") de fast-path
+        # snapshot_download(local_dir="data") tra ve dung "data/youtube-vos-2019/...".
+        rel = p.relative_to(DATA_DIR).as_posix()
+        api.upload_file(
+            path_or_fileobj=str(p),
+            path_in_repo=rel,
             repo_id=HF_REPO_ID,
             repo_type=HF_REPO_TYPE,
-            folder_path=DATA_DIR,
-        )
-    except AttributeError:
-        log("hf_hub cu khong co upload_large_folder -> dung upload_folder...")
-        api.upload_folder(
-            repo_id=HF_REPO_ID,
-            repo_type=HF_REPO_TYPE,
-            folder_path=DATA_DIR,
             token=token,
-            commit_message="Upload Refer-Youtube-VOS dataset + cache pkl",
+            commit_message="Upload cache {}".format(p.name),
         )
+        log("  + {}".format(rel))
     log("Upload XONG: https://huggingface.co/datasets/{}".format(HF_REPO_ID))
 
 
