@@ -108,6 +108,14 @@ def build_pkl_via_trainer():
     from types import SimpleNamespace
     from trainer import Trainer  # import o day de fast-path khong phai load torch model
 
+    # QUAN TRONG: splits o day PHAI khop y het --splits luc train. Voi moi split,
+    # set_dataset build {split}/mymeta_eval.pkl; neu thieu, fast-path se khong co
+    # data tho de build bu -> FileNotFoundError meta_expressions.json.
+    # Override duoc qua bien moi truong PREPARE_SPLITS (vd: "train valid").
+    # Mac dinh "train" vi lenh train that dung --splits train.
+    splits = os.environ.get("PREPARE_SPLITS", "train").split()
+    log("Build pkl cho splits = {} (set PREPARE_SPLITS de doi).".format(splits))
+
     # args giong het get_arguments() trong pretrain.py (mac dinh) + chon arch/dataset/splits
     args = SimpleNamespace(
         arch="base_model",
@@ -127,14 +135,14 @@ def build_pkl_via_trainer():
         max_skip=2,
         dataset="refer-yv-2019",
         test_dataset=None,
-        splits=["valid"],
+        splits=splits,
         checkpoint="",
         epoch=-1,
     )
 
     log("Build pkl: dung Trainer (mimic pretrain.py), BO QUA .cuda()...")
     trainer = Trainer(args)
-    # Day la buoc trigger set_meta_file() -> build mymeta.pkl (train) + mymeta_eval.pkl (valid)
+    # Day la buoc trigger set_meta_file() -> build train/mymeta.pkl + {split}/mymeta_eval.pkl
     trainer.set_dataset(args.dataset, args.splits, args.test_dataset)
     log("Build pkl DONE.")
 

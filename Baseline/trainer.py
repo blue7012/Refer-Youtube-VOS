@@ -228,6 +228,12 @@ class Trainer():
         for self.epoch in range(self.epoch, self.max_epoch):
             
             self.update_hyperparam_epoch()
+
+            # re-assert frozen encoder BN (eval mode is lost if the model is put
+            # back into train() mode between epochs)
+            bn_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            bn_model.freeze_bn()
+
             self.logger.info('=========== EPOCH {} | LR {} | N {} =========='.format(self.epoch+1, self.lr, self.N))
 
             batch_time = AverageMeter('Time', ':6.3f')
@@ -265,6 +271,8 @@ class Trainer():
 
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 

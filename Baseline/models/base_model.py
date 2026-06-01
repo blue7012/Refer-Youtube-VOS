@@ -151,10 +151,25 @@ class Mask(nn.Module):
         
         self.embs = nn.ModuleList([nn.Embedding(dict_size, 1000)])
         self.cas = nn.ModuleList([CrossAtt(vis_dim=2048, lang_dim=1000)])
-        
+
         self.decoder = Decoder()
- 
-    def forward(self, prev_frames, prev_masks, in_frames, words, eval=False):     
+
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        # Keep the pretrained ResNet BatchNorm in eval mode (fixed ImageNet
+        # running stats) and stop its affine updates. With trainable BN the
+        # encoder's activation scale drifts under AMP fp16 until the logits
+        # overflow -> CrossEntropyLoss(inf) = nan (and GradScaler then skips
+        # every step, freezing the model in the nan state). Must be re-asserted
+        # whenever the model is put back into train() mode.
+        for m in self.encoder.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+
+    def forward(self, prev_frames, prev_masks, in_frames, words, eval=False):
         
 #         B,_,H,W = in_frames.size()
 
