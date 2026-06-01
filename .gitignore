@@ -1,0 +1,12 @@
+# Secrets — KHONG commit token
+.env
+**/.env
+
+# Dataset nang + cache (lay tu HuggingFace)
+Baseline/data/
+**/*.pkl
+**/corpus.pth
+
+# Python
+__pycache__/
+*.pyc
