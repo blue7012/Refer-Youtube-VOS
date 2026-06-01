@@ -21,8 +21,14 @@
 from __future__ import print_function
 import os
 import sys
+import logging
 import subprocess
 from pathlib import Path
+
+# --- Tat log spam tu httpx (moi preupload POST in 1 dong INFO) ---
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+for _noisy in ("httpx", "httpcore", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # --- Cau hinh co dinh ---
 HF_REPO_ID = "blue7012/refer-youtube-clean"
@@ -176,6 +182,11 @@ def main():
     token = load_env_token()
 
     from huggingface_hub import HfApi
+    try:
+        from huggingface_hub.utils import logging as hf_logging
+        hf_logging.set_verbosity_warning()
+    except Exception:
+        pass
     api = HfApi()
 
     log("Kiem tra repo {} (type={})...".format(HF_REPO_ID, HF_REPO_TYPE))

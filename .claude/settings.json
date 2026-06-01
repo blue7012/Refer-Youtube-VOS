@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(cat .gitignore)",
-      "Bash(cat Baseline/.gitignore)"
+      "Bash(cat Baseline/.gitignore)",
+      "Bash(python -m py_compile 0_prepare_data.py)"
     ]
   }
 }
