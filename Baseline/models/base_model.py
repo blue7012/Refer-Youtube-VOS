@@ -154,21 +154,6 @@ class Mask(nn.Module):
 
         self.decoder = Decoder()
 
-        self.freeze_bn()
-
-    def freeze_bn(self):
-        # Keep the pretrained ResNet BatchNorm in eval mode (fixed ImageNet
-        # running stats) and stop its affine updates. With trainable BN the
-        # encoder's activation scale drifts under AMP fp16 until the logits
-        # overflow -> CrossEntropyLoss(inf) = nan (and GradScaler then skips
-        # every step, freezing the model in the nan state). Must be re-asserted
-        # whenever the model is put back into train() mode.
-        for m in self.encoder.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-                for p in m.parameters():
-                    p.requires_grad_(False)
-
     def forward(self, prev_frames, prev_masks, in_frames, words, eval=False):
         
 #         B,_,H,W = in_frames.size()
@@ -176,9 +161,9 @@ class Mask(nn.Module):
         embed = self.embs[0](words)
         vis_r5s, vis_r4s, vis_r3s, vis_r2s, vis_c1s = self.encoder(in_frames)
         multi_r5s = self.cas[0](vis_r5s, embed)
-        
+
         logit = self.decoder(multi_r5s, vis_r5s, vis_r4s, vis_r3s, vis_r2s, vis_c1s)
         mask = F.softmax(logit, dim=1)
-            
+
         return mask, logit
 

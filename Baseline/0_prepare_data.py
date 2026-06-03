@@ -13,8 +13,12 @@
 # Logic:
 #   - Repo HF CHUA ton tai  -> build pkl (mimic pretrain.py) roi upload TOAN BO
 #                              data/ (dataset + pkl + vocabulary_Gref.txt + corpus.pth)
-#   - Repo HF DA ton tai     -> chi tai ve pkl + corpus.pth + vocabulary_Gref.txt
-#                              (fast path: bo qua doan doc moi mask PNG)
+#   - Repo HF DA ton tai     -> tai data.zip (FULL: anh + mask + meta_expressions.json
+#                              + pkl + corpus + vocab) roi giai nen vao 'data/'.
+#                              trainer.py / REFER_YV_2019 CAN meta_expressions.json va
+#                              anh, nen fast-path cache-only khong du.
+#                              Dat PREPARE_CACHE_ONLY=1 de chi keo cache pkl (khi anh +
+#                              meta da co san tren may).
 #
 # Token doc tu file .env (bien HF_TOKEN), tim o Baseline/.env va ../.env
 # ============================================================
@@ -117,11 +121,14 @@ def build_pkl_via_trainer():
     log("Build pkl cho splits = {} (set PREPARE_SPLITS de doi).".format(splits))
 
     # args giong het get_arguments() trong pretrain.py (mac dinh) + chon arch/dataset/splits
+    # LUU Y: Trainer.__init__ doc args.no_eval (tu --no-eval) -> BAT BUOC phai co,
+    # neu thieu se AttributeError. Build cache khong can eval nen de True.
     args = SimpleNamespace(
         arch="base_model",
         desc="",
         eval=False,
         eval_first=False,
+        no_eval=True,
         init_lr=1e-4,
         batch_size=16,
         test_batch_size=0,
@@ -214,7 +221,10 @@ def upload_full_dataset(api, token):
 
 
 def download_cache_only(token):
-    """Fast path: chi keo pkl + corpus.pth + vocabulary_Gref.txt ve thu muc data/."""
+    """Fast path (chi cache): keo pkl + corpus.pth + vocabulary_Gref.txt ve 'data/'.
+    LUU Y: KHONG du de train/eval — REFER_YV_2019 con can meta_expressions.json va
+    anh JPEG/mask PNG. Chi dung khi anh+meta DA co san tren may. Mac dinh dung
+    download_and_extract_data() de tai du. Bat lai bang PREPARE_CACHE_ONLY=1."""
     from huggingface_hub import snapshot_download
 
     log("Repo da ton tai -> chi tai cache ({}) ve '{}/'...".format(
@@ -227,6 +237,50 @@ def download_cache_only(token):
         token=token,
     )
     log("Tai cache XONG. Train sau nay se load pkl tuc thi (bo qua doc PNG).")
+
+
+def download_and_extract_data(token):
+    """Tai data.zip (FULL dataset: anh + mask + meta_expressions.json + pkl + corpus
+    + vocab) roi giai nen vao thu muc Baseline/ -> tao 'data/youtube-vos-2019/...'.
+
+    Day la path mac dinh vi trainer.py / REFER_YV_2019 can meta_expressions.json (va
+    anh) chu KHONG chi pkl; fast-path cache-only se bao thieu meta_expressions.json."""
+    import zipfile
+    from huggingface_hub import hf_hub_download
+
+    data_root = Path(DATA_DIR)
+    # Sentinel: neu meta_expressions.json (split train) da co thi coi nhu da giai nen.
+    sentinel = data_root / "youtube-vos-2019" / "train" / "meta_expressions.json"
+    if sentinel.exists():
+        log("Data da co san ({}) -> bo qua tai/giai nen.".format(sentinel))
+        return
+
+    zip_path = Path(DATA_ZIP_NAME)
+    if zip_path.exists():
+        log("Da co {} san ({:.1f} GB) -> dung lai (xoa file neu muon tai lai).".format(
+            zip_path, zip_path.stat().st_size / 1e9))
+    else:
+        log("Tai {} tu {} (one-time, ~9.7GB, co the lau)...".format(
+            DATA_ZIP_NAME, HF_REPO_ID))
+        local = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            repo_type=HF_REPO_TYPE,
+            filename=DATA_ZIP_NAME,
+            local_dir=".",
+            token=token,
+        )
+        zip_path = Path(local)
+
+    # Entry trong zip co dang "data/youtube-vos-2019/..." (arcname=str(p) tinh tu
+    # Baseline), nen giai nen tai cwd=Baseline la ra dung "data/...".
+    log("Giai nen {} -> {}/ ...".format(zip_path, Path(".").resolve()))
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(".")
+    if not sentinel.exists():
+        raise SystemExit(
+            "Giai nen xong nhung khong thay {} — kiem tra lai cau truc data.zip.".format(
+                sentinel))
+    log("Giai nen XONG. Data day du san sang o '{}/'.".format(DATA_DIR))
 
 
 def main():
@@ -246,7 +300,13 @@ def main():
     exists = api.repo_exists(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, token=token)
 
     if exists:
-        download_cache_only(token)
+        # Mac dinh tai + giai nen FULL data.zip (co meta_expressions.json + anh) de
+        # khop voi trainer.py. Dat PREPARE_CACHE_ONLY=1 neu chi muon keo cache pkl
+        # (khi anh + meta da co san tren may).
+        if os.environ.get("PREPARE_CACHE_ONLY") == "1":
+            download_cache_only(token)
+        else:
+            download_and_extract_data(token)
     else:
         log("Repo CHUA ton tai -> build pkl roi upload toan bo dataset.")
         build_pkl_via_trainer()

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import division
 import warnings
+
 warnings.simplefilter("ignore", UserWarning)
 
 import torch
@@ -23,9 +24,9 @@ from shutil import copyfile
 import math
 
 ### My libs
-sys.path.append('utils/')
-sys.path.append('models/')
-sys.path.append('dataset/')
+sys.path.append("utils/")
+sys.path.append("models/")
+sys.path.append("dataset/")
 
 from utils.helpers import *
 
@@ -34,153 +35,182 @@ from eval_utils import *
 
 import dataset.factory as factory
 
-DATA_ROOT = Path('./data')
-CHECKPOINT_ROOT = Path('./checkpoint')
-OUTPUT_IMG_ROOT = Path('./validation')
-EVALUTAION_ROOT = Path('./evaluation')
+DATA_ROOT = Path("./data")
+CHECKPOINT_ROOT = Path("./checkpoint")
+OUTPUT_IMG_ROOT = Path("./validation")
+EVALUTAION_ROOT = Path("./evaluation")
 
 
-class Trainer():
-
+class Trainer:
     def __init__(self, args):
         import importlib
-        
+
         self.args = args
-        
+
         self.init_lr = args.init_lr if args.init_lr else 1e-4
         self.lr = 0
-        
+
         self.epoch = -1
         self.max_epoch = args.max_epoch
         self.decay_epochs = args.decay_epochs
         self.lr_decay = args.lr_decay
         self.save_every = 1 if not args.save_every else args.save_every
-        
+
         self.img_size = (args.img_size, args.img_size)
         self.batch_size = args.batch_size
-        self.test_batch_size = args.test_batch_size if args.test_batch_size else args.batch_size
+        self.test_batch_size = (
+            args.test_batch_size if args.test_batch_size else args.batch_size
+        )
         self.max_N = 2 if not args.max_N else args.max_N
         self.max_skip = args.max_skip
 
         self.desc = args.desc
         self.arch = args.arch
         self.splits = args.splits
-            
-        self.model = importlib.import_module('models.{}'.format(self.arch)).Mask()
-        self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.lr)
-        self.criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        self.no_eval = args.no_eval
+
+        self.model = importlib.import_module("models.{}".format(self.arch)).Mask()
+        self.optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.lr
+        )
+        self.criterion = torch.nn.CrossEntropyLoss(reduction="none")
         self.scheme = self.base_scheme
-        self.scaler = torch.amp.GradScaler('cuda')
-        
+        # AMP disabled: this model's activations exceed fp16's 65504 range in
+        # many layers (encoder convs/BN and the unnormalized decoder), so fp16
+        # overflows to inf -> nan. A disabled scaler is a transparent passthrough
+        # (scale=1, no skipping), so the scaler.* calls below run plain fp32.
+        self.scaler = torch.amp.GradScaler("cuda", enabled=False)
+
         self.logger = get_logger(self.arch)
-        
-        
+
     def get_file_name(self):
         file_name = self.arch
         if self.desc:
-            file_name += '_' + self.desc
+            file_name += "_" + self.desc
         return file_name
-    
-    
+
     def get_save_path(self):
         file_name = self.get_file_name()
         save_path = CHECKPOINT_ROOT / self.dataset / file_name
         return save_path
-            
 
     def cuda(self):
-        print('[DEBUG]   cuda: torch', torch.__version__,
-              '| is_available =', torch.cuda.is_available(),
-              '| device_count =', torch.cuda.device_count(), flush=True)
-        print('[DEBUG]   cuda: forcing CUDA init with a tiny tensor...', flush=True)
-        _t = torch.zeros(1).cuda()   # <-- if it hangs HERE, it is pure CUDA/driver init
+        print(
+            "[DEBUG]   cuda: torch",
+            torch.__version__,
+            "| is_available =",
+            torch.cuda.is_available(),
+            "| device_count =",
+            torch.cuda.device_count(),
+            flush=True,
+        )
+        print("[DEBUG]   cuda: forcing CUDA init with a tiny tensor...", flush=True)
+        _t = torch.zeros(1).cuda()  # <-- if it hangs HERE, it is pure CUDA/driver init
         torch.cuda.synchronize()
-        print('[DEBUG]   cuda: tiny tensor OK on', _t.device,
-              '| name =', torch.cuda.get_device_name(0), flush=True)
-        print('[DEBUG]   cuda: wrapping model in DataParallel + .cuda()...', flush=True)
+        print(
+            "[DEBUG]   cuda: tiny tensor OK on",
+            _t.device,
+            "| name =",
+            torch.cuda.get_device_name(0),
+            flush=True,
+        )
+        print("[DEBUG]   cuda: wrapping model in DataParallel + .cuda()...", flush=True)
         self.model = nn.DataParallel(self.model).cuda()
-        print('[DEBUG]   cuda: model on GPU. moving criterion...', flush=True)
+        print("[DEBUG]   cuda: model on GPU. moving criterion...", flush=True)
         self.criterion = self.criterion.cuda()
-        print('[DEBUG]   cuda: DONE.', flush=True)
-        
+        print("[DEBUG]   cuda: DONE.", flush=True)
 
     def update_hyperparam_epoch(self):
         init_lr = self.init_lr
         self.N = self.max_N
-        
+
         if len(self.decay_epochs) > 0:
             lr = init_lr
             for decay in self.decay_epochs:
-                if self.epoch >= decay: 
+                if self.epoch >= decay:
                     lr = lr * self.lr_decay
-        
+
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group["lr"] = lr
 
         self.lr = lr
 
-        
     def load_model(self, epoch=0):
-        if epoch==0:
+        if epoch == 0:
             file_name = self.get_file_name()
             checkpoint_dir = CHECKPOINT_ROOT / self.dataset / file_name
-            checkpoint_path = max((f.stat().st_mtime, f) for f in checkpoint_dir.glob('*.pth'))[1]
-            self.logger.info('Resume Latest from {}'.format(checkpoint_path))
+            checkpoint_path = max(
+                (f.stat().st_mtime, f) for f in checkpoint_dir.glob("*.pth")
+            )[1]
+            self.logger.info("Resume Latest from {}".format(checkpoint_path))
         else:
-            self.logger.info('Resume from {}'.format(epoch))
+            self.logger.info("Resume from {}".format(epoch))
             file_name = self.get_file_name()
-            checkpoint_path = CHECKPOINT_ROOT / self.dataset / file_name / 'e{:04d}.pth'.format(epoch)
-            
-        checkpoint = torch.load(checkpoint_path, weights_only=False)
-        self.model.load_state_dict((checkpoint['state_dict'])) # Set CUDA before if error occurs.
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.epoch = checkpoint['epoch']
+            checkpoint_path = (
+                CHECKPOINT_ROOT / self.dataset / file_name / "e{:04d}.pth".format(epoch)
+            )
 
-    
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        self.model.load_state_dict(
+            (checkpoint["state_dict"])
+        )  # Set CUDA before if error occurs.
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.epoch = checkpoint["epoch"]
 
     def save_checkpoint(self):
         save_path = self.get_save_path()
-        save_file = 'e{:04d}.pth'.format(self.epoch+1)
+        save_file = "e{:04d}.pth".format(self.epoch + 1)
         if not save_path.exists():
             save_path.mkdir(parents=True, exist_ok=True)
-        
-        torch.save({
-                'epoch': self.epoch,
-                'arch': self.arch,
-                'state_dict': self.model.state_dict(),
-                'optimizer' : self.optimizer.state_dict(),
-                }, save_path / save_file )
+
+        torch.save(
+            {
+                "epoch": self.epoch,
+                "arch": self.arch,
+                "state_dict": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+            },
+            save_path / save_file,
+        )
 
         self.logger.info("Saved a checkpoint {}.".format(save_path / save_file))
 
-        
     def set_dataset(self, dataset, test_splits=[], test_dataset=None):
         assert len(test_splits) > 0
-        
+
         if not test_dataset:
             test_dataset = dataset
-        
+
         self.dataset = dataset
-        print('[DEBUG]   set_dataset: building TRAIN set...', flush=True)
+        print("[DEBUG]   set_dataset: building TRAIN set...", flush=True)
         train_set, train_loader = factory.get_dataset(
-            dataset, DATA_ROOT, self.max_N, self.batch_size, self.img_size,
-            self.max_skip
+            dataset,
+            DATA_ROOT,
+            self.max_N,
+            self.batch_size,
+            self.img_size,
+            self.max_skip,
         )
-        print('[DEBUG]   set_dataset: TRAIN set ready, len =', len(train_set), flush=True)
+        print(
+            "[DEBUG]   set_dataset: TRAIN set ready, len =", len(train_set), flush=True
+        )
         self.train_set = train_set
         self.train_loader = train_loader
 
         val_sets, val_loaders = [], []
         for split in test_splits:
-            print('[DEBUG]   set_dataset: building VAL set split =', split, flush=True)
-            val_set, val_loader = factory.get_dataset_test(test_dataset, split, DATA_ROOT, self.test_batch_size, self.img_size)
-            print('[DEBUG]   set_dataset: VAL set ready, len =', len(val_set), flush=True)
+            print("[DEBUG]   set_dataset: building VAL set split =", split, flush=True)
+            val_set, val_loader = factory.get_dataset_test(
+                test_dataset, split, DATA_ROOT, self.test_batch_size, self.img_size
+            )
+            print(
+                "[DEBUG]   set_dataset: VAL set ready, len =", len(val_set), flush=True
+            )
             val_sets.append(val_set)
             val_loaders.append(val_loader)
         self.val_sets = val_sets
         self.val_loaders = val_loaders
 
-    
     def base_scheme(self, frames, gt_masks, words, eval=False):
         if eval:
             B, T, _, W, H = frames.size()
@@ -188,82 +218,175 @@ class Trainer():
 
             loss = 0.0
             prev_frame, prev_mask = None, None
-            
-            for t in range(0, T):
-                mask_pred, logit =\
-                    self.model(prev_frame, prev_mask, frames[:,t], words, eval=True)
 
-                loss += torch.mean(self.criterion(logit, gt_masks[:,t].long()))
+            for t in range(0, T):
+                mask_pred, logit = self.model(
+                    prev_frame, prev_mask, frames[:, t], words, eval=True
+                )
+
+                loss += torch.mean(self.criterion(logit, gt_masks[:, t].long()))
 
                 prev_frame, prev_mask = frames[:, t], mask_pred[:, 1]
-                est_masks[:,t] = mask_pred[:,1].detach()
-                
+                est_masks[:, t] = mask_pred[:, 1].detach()
+
             return est_masks, loss, 0, T
-                
-            
+
         N = frames.size(1)
         est_masks = torch.zeros_like(gt_masks)
         loss = 0.0
 
-        prev_frame, prev_mask = None, None 
+        prev_frame, prev_mask = None, None
 
         for n in range(0, N):
-            mask_pred, logit =\
-                self.model(prev_frame, prev_mask, frames[:,n], words, eval=False)
-            
-            loss += torch.mean(self.criterion(logit, gt_masks[:,n].long()))
+            mask_pred, logit = self.model(
+                prev_frame, prev_mask, frames[:, n], words, eval=False
+            )
+
+            loss += torch.mean(self.criterion(logit, gt_masks[:, n].long()))
 
             prev_frame = frames[:, n]
             prev_mask = gt_masks[:, n]
-            est_masks[:,n] = mask_pred[:,1].detach() # cut grad
-                
+            est_masks[:, n] = mask_pred[:, 1].detach()  # cut grad
+
         return est_masks, loss, 0, N
-    
-    
-        
-            
+
+    def _localize_nan(self, frames, gt_masks, words, V):
+        """Re-run the offending batch through the raw (non-DataParallel) model with
+        forward hooks to report the FIRST module whose output goes non-finite."""
+        raw = (
+            self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        )
+        store = {}
+
+        def make_hook(name):
+            def hook(m, inp, out):
+                for o in out if isinstance(out, (tuple, list)) else [out]:
+                    if (
+                        torch.is_tensor(o)
+                        and o.is_floating_point()
+                        and not torch.isfinite(o).all()
+                    ):
+                        if "module" not in store:
+                            fin = torch.isfinite(o)
+                            store["module"] = name
+                            store["type"] = type(m).__name__
+                            store["frac_bad"] = (1.0 - fin.float().mean()).item()
+                            store["absmax_finite"] = (
+                                o[fin].abs().max().item() if fin.any() else float("inf")
+                            )
+
+            return hook
+
+        handles = [
+            m.register_forward_hook(make_hook(n))
+            for n, m in raw.named_modules()
+            if len(list(m.children())) == 0
+        ]
+
+        self.logger.error(
+            "NAN-DEBUG inputs | frames finite=%s min=%.3f max=%.3f | mask uniq=%s | words min=%d max=%d"
+            % (
+                bool(torch.isfinite(frames).all()),
+                frames.min().item(),
+                frames.max().item(),
+                torch.unique(gt_masks).tolist()[:6],
+                int(words.min().item()),
+                int(words.max().item()),
+            )
+        )
+
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
+            prev_f, prev_m = None, None
+            for n in range(frames.size(1)):
+                _, logit = raw(prev_f, prev_m, frames[:, n], words, eval=False)
+                fin = torch.isfinite(logit)
+                self.logger.error(
+                    "NAN-DEBUG frame %d | logit finite=%s absmax_finite=%.1f"
+                    % (
+                        n,
+                        bool(fin.all()),
+                        logit[fin].abs().max().item() if fin.any() else float("inf"),
+                    )
+                )
+                prev_f, prev_m = frames[:, n], gt_masks[:, n]
+
+        for h in handles:
+            h.remove()
+
+        if "module" in store:
+            self.logger.error(
+                "NAN-DEBUG >>> first non-finite module: %s (%s) | frac_bad=%.4f | absmax_finite_before=%.1f"
+                % (
+                    store["module"],
+                    store["type"],
+                    store["frac_bad"],
+                    store["absmax_finite"],
+                )
+            )
+        else:
+            self.logger.error(
+                "NAN-DEBUG >>> no module output flagged -> nan is in the loss/criterion itself"
+            )
+        self.logger.error(
+            "NAN-DEBUG offending ann_ids: %s" % (V[3] if len(V) > 3 else "n/a",)
+        )
+
     def train(self):
         self.epoch += 1
-        
+
         for self.epoch in range(self.epoch, self.max_epoch):
-            
             self.update_hyperparam_epoch()
+            self.logger.info(
+                "=========== EPOCH {} | LR {} | N {} ==========".format(
+                    self.epoch + 1, self.lr, self.N
+                )
+            )
 
-            # re-assert frozen encoder BN (eval mode is lost if the model is put
-            # back into train() mode between epochs)
-            bn_model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-            bn_model.freeze_bn()
-
-            self.logger.info('=========== EPOCH {} | LR {} | N {} =========='.format(self.epoch+1, self.lr, self.N))
-
-            batch_time = AverageMeter('Time', ':6.3f')
-            data_time = AverageMeter('Data', ':6.3f')
-            losses = AverageMeter('Loss', ':2.4f')
-            IoUs = [AverageMeter('IoU_{}'.format(i), ':3.4f') for i in range(self.max_N)]
-            mIoU = AverageMeter('mIoU', ':3.4f')
+            batch_time = AverageMeter("Time", ":6.3f")
+            data_time = AverageMeter("Data", ":6.3f")
+            losses = AverageMeter("Loss", ":2.4f")
+            IoUs = [
+                AverageMeter("IoU_{}".format(i), ":3.4f") for i in range(self.max_N)
+            ]
+            mIoU = AverageMeter("mIoU", ":3.4f")
 
             end = time.time()
 
-            print('[DEBUG]   train: waiting for FIRST batch from DataLoader '
-                  '(num_workers=8)... if stuck here, the worker __getitem__ is the bottleneck', flush=True)
+            print(
+                "[DEBUG]   train: waiting for FIRST batch from DataLoader "
+                "(num_workers=8)... if stuck here, the worker __getitem__ is the bottleneck",
+                flush=True,
+            )
             for i, V in enumerate(tqdm(self.train_loader, dynamic_ncols=True)):
-
                 if i == 0:
-                    print('[DEBUG]   train: GOT first batch!', flush=True)
+                    print("[DEBUG]   train: GOT first batch!", flush=True)
                 data_time.update(time.time() - end)
 
-                frames, gt_masks, words, _ = V  
+                frames, gt_masks, words, _ = V
                 frames, gt_masks, words = ToCuda([frames, gt_masks, words])
 
-                with torch.amp.autocast('cuda'):
-                    est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=False)
+                with torch.amp.autocast("cuda", enabled=False):
+                    est_masks, loss, N_start, N_end = self.scheme(
+                        frames, gt_masks, words, eval=False
+                    )
+
+                if not torch.isfinite(loss):
+                    self.logger.error(
+                        "NAN-DEBUG: first non-finite loss at epoch {} iter {}".format(
+                            self.epoch + 1, i + 1
+                        )
+                    )
+                    self._localize_nan(frames, gt_masks, words, V)
+                    raise SystemExit(
+                        "NAN-DEBUG: stopped at first non-finite loss; see log above."
+                    )
 
                 losses.update(loss.item(), N_end - N_start)
-                iou = [0]*self.N
+                iou = [0] * self.N
                 for n in range(N_start, N_end):
-                    iou_n = IoU(est_masks[:,n], gt_masks[:,n])
+                    iou_n = IoU(est_masks[:, n], gt_masks[:, n])
                     iou[n] = iou_n
-                miou = sum(iou[N_start:N_end])/(N_end - N_start)
+                miou = sum(iou[N_start:N_end]) / (N_end - N_start)
 
                 for n in range(N_start, N_end):
                     IoUs[n].update(iou[n])
@@ -271,40 +394,44 @@ class Trainer():
 
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                
+
                 batch_time.update(time.time() - end)
                 end = time.time()
-                
-                if (i+1) % 100 == 0 or (i+1) == len(self.train_loader):
 
-                    self.logger.info('{} | E [{:d}] | I [{:d}] | {} | {} | {} | {}'.format(
-                        self.arch, self.epoch+1, i+1, losses, mIoU, data_time, batch_time))
-
+                if (i + 1) % 100 == 0 or (i + 1) == len(self.train_loader):
+                    self.logger.info(
+                        "{} | E [{:d}] | I [{:d}] | {} | {} | {} | {}".format(
+                            self.arch,
+                            self.epoch + 1,
+                            i + 1,
+                            losses,
+                            mIoU,
+                            data_time,
+                            batch_time,
+                        )
+                    )
 
             # save a checkpoint
             save_every = self.save_every
             if self.epoch > self.decay_epochs[0]:
                 save_every = min(self.save_every, 5)
-            
+
             if (self.epoch + 1) % save_every == 0:
                 self.save_checkpoint()
                 del loss, frames, gt_masks, words, V, est_masks
-                self.evaluate()
+                if not self.no_eval:
+                    self.evaluate()
                 torch.cuda.empty_cache()
 
-                
-                
     def evaluate(self):
-        
+
         save_path = self.get_save_path()
         for split, val_loader in zip(self.splits, self.val_loaders):
-            split_name = '{}_{}'.format(self.dataset, split)
-            
-            eval_path = save_path / 'evaluation' / split_name
+            split_name = "{}_{}".format(self.dataset, split)
+
+            eval_path = save_path / "evaluation" / split_name
             if not eval_path.exists():
                 eval_path.mkdir(parents=True, exist_ok=True)
 
@@ -313,64 +440,69 @@ class Trainer():
             eval_json.epoch = self.epoch
             eval_json.dataset = self.dataset
 
-            self.logger.info('=========== EVALUATE MODEL {} EPOCH {}  >>>>  {}/{} =========='.format(self.arch, self.epoch+1, self.dataset, split))
+            self.logger.info(
+                "=========== EVALUATE MODEL {} EPOCH {}  >>>>  {}/{} ==========".format(
+                    self.arch, self.epoch + 1, self.dataset, split
+                )
+            )
 
-            batch_time = AverageMeter('Time', ':6.3f')
-            data_time = AverageMeter('Data', ':6.3f')
-            losses = AverageMeter('Loss', ':2.4f')
-            
-            J = AverageMeter('J', ':3.4f')
-            F = AverageMeter('F', ':3.4f')
-            
+            batch_time = AverageMeter("Time", ":6.3f")
+            data_time = AverageMeter("Data", ":6.3f")
+            losses = AverageMeter("Loss", ":2.4f")
+
+            J = AverageMeter("J", ":3.4f")
+            F = AverageMeter("F", ":3.4f")
+
             end = time.time()
-            
+
             precs_thres = np.array([0.5, 0.6, 0.7, 0.8, 0.9])
             precs = np.zeros(len(precs_thres))
             num_samples = 0
-            
+
             with torch.no_grad():
                 for i, V in enumerate(tqdm(val_loader, dynamic_ncols=True)):
-
                     data_time.update(time.time() - end)
 
                     frames, gt_masks, words, ref_ids, num_frames, metas = V
                     T = num_frames.max().item()
 
-                    frames, gt_masks = frames[:, :T] , gt_masks[:, :T]
+                    frames, gt_masks = frames[:, :T], gt_masks[:, :T]
                     B, T, _, W, H = frames.size()
-                    (frames, gt_masks), pad = pad_divide_by([frames, gt_masks], 16, (W, H))
+                    (frames, gt_masks), pad = pad_divide_by(
+                        [frames, gt_masks], 16, (W, H)
+                    )
                     frames, gt_masks, words = ToCuda([frames, gt_masks, words])
 
-                    with torch.amp.autocast('cuda'):
-                        est_masks, loss, N_start, N_end = self.scheme(frames, gt_masks, words, eval=True)
+                    with torch.amp.autocast("cuda", enabled=False):
+                        est_masks, loss, N_start, N_end = self.scheme(
+                            frames, gt_masks, words, eval=True
+                        )
                     losses.update(loss.item(), N_end - N_start)
 
                     # batch GPU metrics — no CPU transfer, no skimage
-                    iou_bt = iou_per_frame_gpu(est_masks, gt_masks)      # (B, T)
-                    f_bt   = boundary_f_score_gpu(est_masks, gt_masks)   # (B, T)
+                    iou_bt = iou_per_frame_gpu(est_masks, gt_masks)  # (B, T)
+                    f_bt = boundary_f_score_gpu(est_masks, gt_masks)  # (B, T)
 
                     for b, n_frame in enumerate(num_frames):
                         j_score = iou_bt[b, :n_frame].mean().item()
-                        f_score = f_bt[b,  :n_frame].mean().item()
-                        ious    = iou_bt[b, :n_frame].tolist()
+                        f_score = f_bt[b, :n_frame].mean().item()
+                        ious = iou_bt[b, :n_frame].tolist()
 
                         J.update(j_score)
                         F.update(f_score)
 
                         eval_json.j_score[ref_ids[b]] = j_score
                         eval_json.f_score[ref_ids[b]] = f_score
-                        eval_json.ious[ref_ids[b]]    = ious
+                        eval_json.ious[ref_ids[b]] = ious
 
                         precs += (j_score > precs_thres).astype(int)
                         num_samples += 1
 
-
                     batch_time.update(time.time() - end)
                     end = time.time()
 
-                        
             precs /= num_samples
-    
+
             eval_json.average_J = J.avg
             eval_json.average_F = F.avg
 
@@ -380,15 +512,20 @@ class Trainer():
             eval_json.prec8 = precs[3]
             eval_json.prec9 = precs[4]
 
-            
-            json.dump(eval_json, open(eval_path / 'e{:04d}.json'.format(self.epoch+1), 'w'))
-            
-            self.logger.warning('{} | E [{:d}] | {} | {} | {} | {} | {}'.format(
-                self.arch, self.epoch+1, losses, J, F, data_time, batch_time,
-            ))
+            json.dump(
+                eval_json, open(eval_path / "e{:04d}.json".format(self.epoch + 1), "w")
+            )
+
+            self.logger.warning(
+                "{} | E [{:d}] | {} | {} | {} | {} | {}".format(
+                    self.arch,
+                    self.epoch + 1,
+                    losses,
+                    J,
+                    F,
+                    data_time,
+                    batch_time,
+                )
+            )
 
             del V, frames
-
-            
-            
-    

@@ -4,6 +4,7 @@
 
 # Dataset nang + cache (lay tu HuggingFace)
 Baseline/data/
+data.zip
 **/*.pkl
 **/corpus.pth
 
