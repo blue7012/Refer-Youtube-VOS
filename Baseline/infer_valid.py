@@ -79,6 +79,10 @@ def main():
         parser.add_argument(
             "--outdir", type=str, default="", help="mac dinh: validation/<arch>_<split>_e<epoch>"
         )
+        parser.add_argument(
+            "--infer_batch", type=int, default=8,
+            help="so chuoi (expression) chay song song moi batch -> tang GPU util",
+        )
         return parser.parse_args()
 
     args = get_arguments()
@@ -110,46 +114,76 @@ def main():
     meta = json.load(open(meta_path))["videos"]
     print("[INFER] >>> {} video tu {}".format(len(meta), meta_path), flush=True)
 
-    n_seq = 0
-    for vid in tqdm(sorted(meta), dynamic_ncols=True):
+    # --- Gom tat ca (video, expression) thanh 1 danh sach "job" de batch ---
+    #     Moi job = 1 chuoi doc lap (base_model khong dung prev_mask -> batch thoai mai).
+    jobs = []  # (vid, expr, sent, frame_ids)
+    for vid in sorted(meta):
         v = meta[vid]
         objs = v["objects"]
-
         for expr in sorted(v["expressions"], key=lambda x: int(x)):
             sent = v["expressions"][expr]["exp"]
             oid = v["expressions"][expr]["obj_id"]
-            frame_ids = objs[oid]["frames"]  # = cac frame co GT cho object nay
+            jobs.append((vid, expr, sent, objs[oid]["frames"]))
 
-            # nap + resize frame (y het load_pair/resize cua dataset), giu size goc
-            frames, orig_size = [], None
-            for fid in frame_ids:
-                jpg = testset.data_root / testset.split / "JPEGImages" / vid / "{}.jpg".format(fid)
-                pil = Image.open(jpg).convert("RGB")
-                orig_size = pil.size  # (W, H) — dung de resize mask ve goc
-                arr = np.float32(pil) / 255.0
-                frm, _ = testset.resize(arr, np.zeros(arr.shape[:2], np.uint8), testset.size)
-                frames.append(frm)
+    bs = max(1, args.infer_batch)
+    print("[INFER] >>> {} chuoi (expression), batch = {}".format(len(jobs), bs), flush=True)
 
-            Fs = torch.from_numpy(
-                np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2)).copy()
-            ).float().unsqueeze(0)  # (1, T, 3, h, w)
-            words = testset.tokenize_sent(sent).unsqueeze(0)  # (1, query_len)
-            gt = torch.zeros(1, Fs.size(1), testset.size[0], testset.size[1])  # dummy cho loss
+    # Cache frame da decode+resize theo (vid, fid): nhieu expression dung chung JPEG
+    # -> tranh doc/resize lai tu disk. Gioi han so entry de khong phinh RAM.
+    frame_cache = {}
 
-            Fs, gt, words = ToCuda([Fs, gt, words])
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=False):
-                    est_masks, _, _, _ = trainer.scheme(Fs, gt, words, eval=True)  # (1, T, h, w)
+    def load_frame(vid, fid):
+        key = (vid, fid)
+        hit = frame_cache.get(key)
+        if hit is not None:
+            return hit
+        jpg = testset.data_root / testset.split / "JPEGImages" / vid / "{}.jpg".format(fid)
+        pil = Image.open(jpg).convert("RGB")
+        orig = pil.size  # (W, H) — de resize mask ve goc
+        arr = np.float32(pil) / 255.0
+        frm, _ = testset.resize(arr, np.zeros(arr.shape[:2], np.uint8), testset.size)
+        chw = np.transpose(frm, (2, 0, 1)).copy()  # (3, h, w)
+        if len(frame_cache) > 512:
+            frame_cache.clear()
+        frame_cache[key] = (chw, orig)
+        return chw, orig
 
-            est = est_masks[0].detach().cpu().numpy()  # (T, h, w) — xac suat foreground
+    n_seq = 0
+    pbar = tqdm(total=len(jobs), dynamic_ncols=True, desc="infer", unit="seq")
+    for i in range(0, len(jobs), bs):
+        batch = jobs[i:i + bs]
+        B = len(batch)
+        Tmax = max(len(j[3]) for j in batch)  # pad chuoi ngan len Tmax
+
+        Fs = torch.zeros(B, Tmax, 3, testset.size[0], testset.size[1])
+        words = torch.zeros(B, testset.query_len, dtype=torch.long)
+        origs = []  # origs[b][t] = (W, H) goc cua frame t trong job b
+        for b, (vid, _expr, sent, frame_ids) in enumerate(batch):
+            job_orig = []
+            for t, fid in enumerate(frame_ids):
+                chw, orig = load_frame(vid, fid)
+                Fs[b, t] = torch.from_numpy(chw)
+                job_orig.append(orig)
+            origs.append(job_orig)
+            words[b] = testset.tokenize_sent(sent)
+
+        gt = torch.zeros(B, Tmax, testset.size[0], testset.size[1])  # dummy cho loss
+        Fs, gt, words = ToCuda([Fs, gt, words])
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=False):
+                est_masks, _, _, _ = trainer.scheme(Fs, gt, words, eval=True)  # (B, Tmax, h, w)
+
+        est = est_masks.detach().cpu().numpy()
+        for b, (vid, expr, _sent, frame_ids) in enumerate(batch):
             save_dir = out_dir / "Annotations" / vid / expr
             save_dir.mkdir(parents=True, exist_ok=True)
-            for t, fid in enumerate(frame_ids):
-                pred = (est[t] > 0.5).astype(np.uint8)
-                pred = cv2.resize(pred, orig_size, interpolation=cv2.INTER_NEAREST)
+            for t, fid in enumerate(frame_ids):  # chi t < len(frame_ids), bo qua phan pad
+                pred = (est[b, t] > 0.5).astype(np.uint8)
+                pred = cv2.resize(pred, origs[b][t], interpolation=cv2.INTER_NEAREST)
                 Image.fromarray((pred * 255).astype(np.uint8)).save(save_dir / "{}.png".format(fid))
-
             n_seq += 1
+        pbar.update(B)
+    pbar.close()
 
     print("[INFER] >>> Da ghi {} chuoi -> {}".format(n_seq, out_dir / "Annotations"), flush=True)
 

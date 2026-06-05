@@ -45,10 +45,47 @@ sys.path.append("models/")
 sys.path.append("dataset/")
 
 from eval_utils import db_eval_iou, db_eval_boundary, AverageMeter
+from utils.helpers import boundary_f_score_gpu
 
 
 def log(msg):
     print("[EVAL] {}".format(msg), flush=True)
+
+
+def _score_seq_gpu(gt_np, pred_np, bound_th, device, chunk):
+    """Cham 1 chuoi tren GPU. gt_np/pred_np: (T,H,W) uint8 {0,1}. Tra (J[T], F[T]).
+    Khop so y het metric CPU goc (da kiem chung |sai khac| = 0)."""
+    T = gt_np.shape[0]
+    Js = np.empty(T, np.float32)
+    Fs = np.empty(T, np.float32)
+    for s in range(0, T, chunk):  # chunk theo frame de gioi han VRAM
+        e = min(s + chunk, T)
+        g = torch.from_numpy(gt_np[s:e]).to(device=device, dtype=torch.float32).unsqueeze(0)
+        p = torch.from_numpy(pred_np[s:e]).to(device=device, dtype=torch.float32).unsqueeze(0)
+        Fs[s:e] = boundary_f_score_gpu(p, g, bound_th=bound_th)[0].cpu().numpy()
+        t = g.shape[1]
+        gg = (g > 0.5).float().reshape(t, -1)
+        pp = (p > 0.5).float().reshape(t, -1)
+        inter = (pp * gg).sum(-1)
+        union = ((pp + gg) - pp * gg).sum(-1)
+        iou = inter / (union + 1e-5)
+        both_empty = (gg.sum(-1) == 0) & (pp.sum(-1) == 0)  # khop db_eval_iou: ca 2 rong -> 1
+        Js[s:e] = torch.where(both_empty, torch.ones_like(iou), iou).cpu().numpy()
+    return Js, Fs
+
+
+def _score_seq_cpu(gt_np, pred_np, bound_th):
+    """Cham 1 chuoi tren CPU (ham skimage goc) — fallback khi khong co CUDA / --cpu."""
+    T = gt_np.shape[0]
+    Js = np.empty(T, np.float32)
+    Fs = np.empty(T, np.float32)
+    for t in range(T):
+        gb = gt_np[t].astype(np.float32)
+        pb = pred_np[t].astype(np.float32)
+        Js[t] = float(db_eval_iou(gb, pb))
+        Fs[t] = float(db_eval_boundary(
+            torch.from_numpy(pb[None]), torch.from_numpy(gb[None]), bound_th=bound_th))
+    return Js, Fs
 
 
 def is_pred_png(name):
@@ -127,6 +164,14 @@ def main():
         parser.add_argument(
             "--per_seq_csv", type=str, default="", help="(tuy chon) ghi vid,expr,J,F ra CSV"
         )
+        parser.add_argument(
+            "--frame_chunk", type=int, default=16,
+            help="so frame cham cung luc tren GPU (gioi han VRAM)",
+        )
+        parser.add_argument(
+            "--cpu", action="store_true",
+            help="ep cham bang CPU (cham hon nhieu, dung de doi chieu so)",
+        )
         return parser.parse_args()
 
     args = get_arguments()
@@ -144,75 +189,86 @@ def main():
     )
     log("GT co {} video -> cham diem TOAN BO chuoi GT.".format(len(gt_vids)))
 
-    J = AverageMeter("J", ":3.4f")
-    F = AverageMeter("F", ":3.4f")
+    # --- Thiet bi: mac dinh GPU (nhanh hon hang tram lan), fallback CPU ---
+    use_cuda = torch.cuda.is_available() and not args.cpu
+    device = torch.device("cuda" if use_cuda else "cpu")
+    log("Metric chay tren: {} (frame_chunk={})".format(
+        "GPU/cuda" if use_cuda else "CPU", args.frame_chunk))
 
-    rows = []  # cho per_seq_csv
-    n_seq_total = 0
-    n_seq_predicted = 0
+    # Liet ke truoc TAT CA chuoi (vid, expr) -> tqdm co tong so + ETA chinh xac
+    seqs = []  # (gt_vid, sub_vid, expr)
+    n_reconciled = 0
     n_vid_missing = 0
-
-    for gt_vid in tqdm(gt_vids, dynamic_ncols=True):
+    for gt_vid in gt_vids:
         sub_vid, reconciled = reconcile_vid(gt_vid, sub_vids)
         if reconciled:
-            log("ID lech -> khop {} -> {}".format(gt_vid, sub_vid))
+            n_reconciled += 1
         if sub_vid is None:
             n_vid_missing += 1
-
         exprs = sorted(
             e.name
             for e in (gt_root / gt_vid).iterdir()
             if e.is_dir() and not e.name.startswith(".")
         )
-
         for expr in exprs:
-            n_seq_total += 1
-            pred_frames = frames_map.get(sub_vid, {}).get(expr, {}) if sub_vid else {}
-            if len(pred_frames) > 0:
-                n_seq_predicted += 1
+            seqs.append((gt_vid, sub_vid, expr))
+    log("{} chuoi GT / {} video ({} video thieu submission, {} ID khop theo prefix)".format(
+        len(seqs), len(gt_vids), n_vid_missing, n_reconciled))
 
-            gt_frames = sorted(
-                f.name
-                for f in (gt_root / gt_vid / expr).glob("*.png")
-                if not f.name.startswith(".")
-            )
+    J = AverageMeter("J", ":3.4f")
+    F = AverageMeter("F", ":3.4f")
+    rows = []  # cho per_seq_csv
+    n_seq_total = 0
+    n_seq_predicted = 0
 
-            seq_j, seq_f = [], []
-            for frame in gt_frames:
-                gt = np.uint8(Image.open(gt_root / gt_vid / expr / frame).convert("P"))
-                gt_bin = (gt > 0).astype(np.float32)
+    pbar = tqdm(seqs, dynamic_ncols=True, unit="seq")
+    for gt_vid, sub_vid, expr in pbar:
+        n_seq_total += 1
+        pred_frames = frames_map.get(sub_vid, {}).get(expr, {}) if sub_vid else {}
+        if len(pred_frames) > 0:
+            n_seq_predicted += 1
 
-                handle = pred_frames.get(frame)
-                if handle is None:
-                    pred_bin = np.zeros_like(gt_bin)  # thieu prediction -> mask rong
-                else:
-                    pr = read_pred(handle)
-                    pred_bin = (pr > 0).astype(np.float32)
-                    if pred_bin.shape != gt_bin.shape:  # an toan: ve dung size GT
-                        pred_bin = cv2.resize(
-                            pred_bin,
-                            (gt_bin.shape[1], gt_bin.shape[0]),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
+        gt_frames = sorted(
+            f.name
+            for f in (gt_root / gt_vid / expr).glob("*.png")
+            if not f.name.startswith(".")
+        )
+        if len(gt_frames) == 0:
+            continue
 
-                # J: numpy; F: tensor (1,H,W) dung db_eval_boundary co san
-                j = db_eval_iou(gt_bin, pred_bin)
-                f = db_eval_boundary(
-                    torch.from_numpy(pred_bin[None]),
-                    torch.from_numpy(gt_bin[None]),
-                    bound_th=args.bound_th,
-                )
-                seq_j.append(float(j))
-                seq_f.append(float(f))
+        # Nap GT + pred cho ca chuoi -> (T, H, W) uint8 {0,1}
+        gt_list, pred_list = [], []
+        H = W = None
+        for frame in gt_frames:
+            gt = np.uint8(Image.open(gt_root / gt_vid / expr / frame).convert("P"))
+            gt_bin = (gt > 0).astype(np.uint8)
+            if H is None:
+                H, W = gt_bin.shape
+            handle = pred_frames.get(frame)
+            if handle is None:
+                pred_bin = np.zeros((H, W), np.uint8)  # thieu prediction -> mask rong
+            else:
+                pred_bin = (read_pred(handle) > 0).astype(np.uint8)
+                if pred_bin.shape != (H, W):  # an toan: ve dung size GT
+                    pred_bin = cv2.resize(pred_bin, (W, H), interpolation=cv2.INTER_NEAREST)
+            gt_list.append(gt_bin)
+            pred_list.append(pred_bin)
 
-            if len(seq_j) == 0:
-                continue
+        gt_np = np.stack(gt_list)      # (T, H, W)
+        pred_np = np.stack(pred_list)  # (T, H, W)
 
-            mean_j = float(np.mean(seq_j))
-            mean_f = float(np.mean(seq_f))
-            J.update(mean_j)  # moi chuoi (vid,expr) 1 phieu, giong trainer.evaluate
-            F.update(mean_f)
-            rows.append((gt_vid, expr, mean_j, mean_f))
+        if use_cuda:
+            seq_j, seq_f = _score_seq_gpu(gt_np, pred_np, args.bound_th, device, args.frame_chunk)
+        else:
+            seq_j, seq_f = _score_seq_cpu(gt_np, pred_np, args.bound_th)
+
+        mean_j = float(seq_j.mean())
+        mean_f = float(seq_f.mean())
+        J.update(mean_j)  # moi chuoi (vid,expr) 1 phieu, giong trainer.evaluate
+        F.update(mean_f)
+        rows.append((gt_vid, expr, mean_j, mean_f))
+        pbar.set_postfix(J="{:.3f}".format(J.avg), F="{:.3f}".format(F.avg))
+    pbar.close()
 
     jf = (J.avg + F.avg) / 2
 
