@@ -7,6 +7,9 @@ Baseline/data/
 data.zip
 **/*.pkl
 **/corpus.pth
+Baseline\valid_sample_submission.zip
+Baseline\valid_submission_sample.zip
+Baseline\valid.zip
 
 # Python
 __pycache__/
